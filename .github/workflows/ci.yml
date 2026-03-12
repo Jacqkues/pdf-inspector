@@ -117,11 +117,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependencies
-        run: pip install maturin pytest
+      - name: Create venv and install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest
 
       - name: Build and install Python package
-        run: maturin develop --release
+        run: |
+          source .venv/bin/activate
+          maturin develop --release
 
       - name: Run Python tests
-        run: pytest tests/test_python.py -v
+        run: |
+          source .venv/bin/activate
+          pytest tests/test_python.py -v
