@@ -103,3 +103,25 @@ jobs:
 
       - name: Build
         run: cargo build --release --verbose
+
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install maturin pytest
+
+      - name: Build and install Python package
+        run: maturin develop --release
+
+      - name: Run Python tests
+        run: pytest tests/test_python.py -v
