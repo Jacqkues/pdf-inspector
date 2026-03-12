@@ -21,11 +21,10 @@ Built by [Firecrawl](https://firecrawl.dev) to handle text-based PDFs locally in
 
 ### Python
 
-Install from source (requires Rust toolchain):
-
 ```bash
-pip install maturin
-maturin develop --release
+uv add pdf-inspector
+# or
+pip install pdf-inspector
 ```
 
 Use it:
