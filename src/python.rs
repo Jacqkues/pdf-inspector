@@ -1,7 +1,7 @@
 //! PyO3 Python bindings for pdf-inspector.
 
-use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use std::collections::HashSet;
 
 use crate::detector::PdfType;
