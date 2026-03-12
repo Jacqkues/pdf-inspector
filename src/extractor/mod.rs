@@ -56,13 +56,32 @@ pub fn extract_text_mem(buffer: &[u8]) -> Result<String, PdfError> {
     extract_text_from_doc(&doc)
 }
 
-/// Extract text from loaded document
+/// Extract text from loaded document.
+///
+/// Uses the library's own positioned extraction pipeline instead of lopdf's
+/// built-in `extract_text`, which can fail on fonts missing `ToUnicode` CMaps.
 fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
-    let pages = doc.get_pages();
-    let page_nums: Vec<u32> = pages.keys().cloned().collect();
+    let font_cmaps = FontCMaps::from_doc(doc);
+    let (items, _, _) = extract_positioned_text_from_doc(doc, &font_cmaps, None)?;
 
-    doc.extract_text(&page_nums)
-        .map_err(|e| PdfError::Parse(e.to_string()))
+    let mut lines = group_into_lines(items);
+    lines.sort_by(|a, b| {
+        a.page
+            .cmp(&b.page)
+            .then_with(|| b.y.partial_cmp(&a.y).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    let mut result = String::new();
+    let mut last_page = 0u32;
+    for line in &lines {
+        if line.page != last_page && last_page > 0 {
+            result.push('\n');
+        }
+        last_page = line.page;
+        result.push_str(&line.text());
+        result.push('\n');
+    }
+    Ok(result)
 }
 
 /// Extract text with position information from PDF file
