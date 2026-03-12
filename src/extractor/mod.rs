@@ -174,7 +174,13 @@ pub(crate) fn extract_positioned_text_from_doc(
                 continue;
             }
         }
-        let (items, rects, lines) = extract_page_text_items(doc, page_id, *page_num, font_cmaps)?;
+        let (items, rects, lines) = match extract_page_text_items(doc, page_id, *page_num, font_cmaps) {
+            Ok(result) => result,
+            Err(e) => {
+                log::warn!("page {}: extraction failed, skipping: {}", page_num, e);
+                continue;
+            }
+        };
         debug!(
             "page {}: {} text items, {} rects, {} lines",
             page_num,
