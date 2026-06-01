@@ -53,7 +53,7 @@ pub fn extract_text_mem(buffer: &[u8]) -> Result<String, PdfError> {
 /// built-in `extract_text`, which can fail on fonts missing `ToUnicode` CMaps.
 fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
     let font_cmaps = FontCMaps::from_doc(doc);
-    let (items, _, _) = extract_positioned_text_from_doc(doc, &font_cmaps, None)?;
+    let ((items, _, _), _, _) = extract_positioned_text_from_doc(doc, &font_cmaps, None)?;
 
     let mut lines = group_into_lines(items);
     lines.sort_by(|a, b| {
