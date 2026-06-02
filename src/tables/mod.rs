@@ -5,15 +5,20 @@
 mod detect_heuristic;
 mod detect_lines;
 mod detect_rects;
+mod detect_struct;
 mod financial;
 mod format;
 mod grid;
+pub mod structured;
 
 pub use detect_heuristic::detect_tables;
+pub(crate) use detect_heuristic::is_table_of_contents;
 pub use detect_lines::detect_tables_from_lines;
 pub(crate) use detect_rects::cluster_rects;
 pub use detect_rects::{detect_tables_from_rects, RectHintRegion};
+pub use detect_struct::detect_tables_from_struct_tree;
 pub use format::table_to_markdown;
+pub use structured::{cells_to_markdown, StructuredCell};
 
 use crate::types::TextItem;
 
@@ -31,7 +36,7 @@ pub(crate) fn try_build_rect_guided_table(
 
     // 1. Derive column boundaries from rect X positions (snapped to 2pt tolerance)
     let mut x_lefts: Vec<f32> = cluster_rects.iter().map(|&(x, _, _, _)| x).collect();
-    x_lefts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x_lefts.sort_by(|a, b| a.total_cmp(b));
     // Snap: deduplicate within 2pt tolerance
     let mut col_boundaries: Vec<f32> = Vec::new();
     for x in &x_lefts {
@@ -52,7 +57,7 @@ pub(crate) fn try_build_rect_guided_table(
     // boundaries so every day gets a column.
     if col_boundaries.len() >= 2 {
         let mut spacings: Vec<f32> = col_boundaries.windows(2).map(|w| w[1] - w[0]).collect();
-        spacings.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        spacings.sort_by(|a, b| a.total_cmp(b));
         let median_spacing = spacings[spacings.len() / 2];
         let threshold = median_spacing * 1.5;
 
@@ -85,7 +90,7 @@ pub(crate) fn try_build_rect_guided_table(
 
     // 3. Derive row boundaries from item Y positions (5pt tolerance)
     let mut y_values: Vec<f32> = expanded_items.iter().map(|(item, _)| item.y).collect();
-    y_values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // descending
+    y_values.sort_by(|a, b| b.total_cmp(a)); // descending
     let mut row_boundaries: Vec<f32> = Vec::new();
     for y in &y_values {
         if row_boundaries
@@ -164,12 +169,12 @@ pub(crate) fn try_build_rect_guided_table(
     used_indices.sort_unstable();
     used_indices.dedup();
 
-    Some(Table {
-        columns: col_boundaries,
-        rows: row_boundaries,
+    Some(Table::new(
+        col_boundaries,
+        row_boundaries,
         cells,
-        item_indices: used_indices,
-    })
+        used_indices,
+    ))
 }
 
 /// Split a TextItem whose text contains multiple whitespace-separated tokens
@@ -231,6 +236,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_bold: item.is_bold,
             is_italic: item.is_italic,
             item_type: item.item_type.clone(),
+            mcid: item.mcid,
         });
     }
 
@@ -250,6 +256,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
             is_bold: item.is_bold,
             is_italic: item.is_italic,
             item_type: item.item_type.clone(),
+            mcid: item.mcid,
         });
     }
 
@@ -265,6 +272,827 @@ pub(crate) enum TableDetectionMode {
     BodyFont,
 }
 
+/// Build a table from layout-detected column boundaries.
+///
+/// When the layout engine detects multiple tabular columns (not newspaper),
+/// this function uses those boundaries to construct a Table directly. This
+/// handles borderless tables (no rects/lines) where columns are defined
+/// purely by text alignment — common in exam/reference tables.
+///
+/// Requires ≥3 columns, ≥3 rows, and ≥40% cell fill rate.
+pub(crate) fn try_build_table_from_columns(items: &[TextItem], page: u32) -> Option<Table> {
+    use crate::extractor::{
+        detect_columns, group_into_lines_with_thresholds, is_newspaper_layout, ColumnRegion,
+    };
+    use std::collections::HashMap;
+
+    let mut columns = detect_columns(items, page, false);
+    if columns.len() < 4 {
+        return None;
+    }
+
+    // Refine columns: look for header-like rows where multiple items share
+    // the same Y and are evenly spaced. If a wide column contains two header
+    // items, split it at the gap between them.
+    let page_items: Vec<&TextItem> = items.iter().filter(|i| i.page == page).collect();
+    let y_tol = 3.0;
+
+    // Find the top-most row with items in multiple columns (likely the header)
+    let mut ys: Vec<f32> = page_items.iter().map(|i| i.y).collect();
+    ys.sort_by(|a, b| b.total_cmp(a));
+    ys.dedup_by(|a, b| (*a - *b).abs() < y_tol);
+
+    for &header_y in ys.iter().take(5) {
+        let row_items: Vec<&&TextItem> = page_items
+            .iter()
+            .filter(|i| (i.y - header_y).abs() < y_tol)
+            .collect();
+        if row_items.len() < columns.len() {
+            continue;
+        }
+        // Check if any column contains 2+ items at this Y — needs splitting
+        let mut new_columns = Vec::new();
+        let mut did_split = false;
+        for col in &columns {
+            let col_items: Vec<&&&TextItem> = row_items
+                .iter()
+                .filter(|i| i.x >= col.x_min && i.x < col.x_max)
+                .collect();
+            if col_items.len() >= 2 {
+                // Sort by X and find the split point
+                let mut sorted: Vec<f32> = col_items.iter().map(|i| i.x).collect();
+                sorted.sort_by(|a, b| a.total_cmp(b));
+                // Split at the midpoint between the two items
+                let split_x = (sorted[0]
+                    + col_items.iter().find(|i| i.x == sorted[0]).unwrap().width
+                    + sorted[1])
+                    / 2.0;
+                new_columns.push(ColumnRegion {
+                    x_min: col.x_min,
+                    x_max: split_x,
+                });
+                new_columns.push(ColumnRegion {
+                    x_min: split_x,
+                    x_max: col.x_max,
+                });
+                did_split = true;
+            } else {
+                new_columns.push(col.clone());
+            }
+        }
+        if did_split {
+            log::debug!(
+                "column refinement: {} -> {} columns from header row at y={:.1}",
+                columns.len(),
+                new_columns.len(),
+                header_y
+            );
+            columns = new_columns;
+            break;
+        }
+    }
+
+    // Group items into per-column lines to check newspaper vs tabular
+    let mut col_buckets: Vec<Vec<TextItem>> = vec![Vec::new(); columns.len()];
+    let mut spanning_items: Vec<TextItem> = Vec::new();
+    for item in items {
+        if item.page != page {
+            continue;
+        }
+        // Check if item spans multiple columns
+        let item_left = item.x;
+        let item_right = item.x + item.width;
+        let mut spans = 0;
+        for col in &columns {
+            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+            if overlap > 0.0 {
+                spans += 1;
+            }
+        }
+        if spans > 1 {
+            spanning_items.push(item.clone());
+            continue;
+        }
+        // Assign to best-overlap column
+        let mut best_col = 0;
+        let mut best_overlap = f32::NEG_INFINITY;
+        for (ci, col) in columns.iter().enumerate() {
+            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best_col = ci;
+            }
+        }
+        col_buckets[best_col].push(item.clone());
+    }
+
+    let thresholds = HashMap::new();
+    let per_column_lines: Vec<Vec<crate::types::TextLine>> = col_buckets
+        .iter()
+        .map(|bucket| {
+            group_into_lines_with_thresholds(
+                bucket.clone(),
+                &thresholds,
+                &std::collections::HashSet::new(),
+            )
+        })
+        .collect();
+
+    // Must be tabular (not newspaper) layout
+    if is_newspaper_layout(&per_column_lines, &columns) {
+        return None;
+    }
+
+    // Collect all unique Y positions across all columns (row boundaries)
+    let y_tol = 5.0;
+    let mut row_ys: Vec<f32> = Vec::new();
+    for col_lines in &per_column_lines {
+        for line in col_lines {
+            let y = line.y;
+            if !row_ys.iter().any(|&ry| (ry - y).abs() < y_tol) {
+                row_ys.push(y);
+            }
+        }
+    }
+    row_ys.sort_by(|a, b| b.total_cmp(a));
+
+    if row_ys.len() < 3 || row_ys.len() > 40 {
+        return None;
+    }
+
+    // Build cell grid
+    let col_xs: Vec<f32> = columns.iter().map(|c| c.x_min).collect();
+    let mut cells: Vec<Vec<String>> = vec![vec![String::new(); columns.len()]; row_ys.len()];
+    let mut item_indices: Vec<usize> = Vec::new();
+
+    for (item_idx, item) in items.iter().enumerate() {
+        if item.page != page {
+            continue;
+        }
+        // Find column
+        let item_left = item.x;
+        let item_right = item.x + item.width;
+        let mut best_col = None;
+        let mut best_overlap = 0.0f32;
+        let mut span_count = 0;
+        for (ci, col) in columns.iter().enumerate() {
+            let overlap = (item_right.min(col.x_max) - item_left.max(col.x_min)).max(0.0);
+            if overlap > 0.0 {
+                span_count += 1;
+            }
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best_col = Some(ci);
+            }
+        }
+        if span_count > 1 || best_col.is_none() {
+            continue; // spanning item, skip
+        }
+        let col = best_col.unwrap();
+
+        // Find row
+        let row = row_ys.iter().position(|&ry| (ry - item.y).abs() < y_tol);
+        if let Some(row) = row {
+            if !cells[row][col].is_empty() {
+                cells[row][col].push(' ');
+            }
+            cells[row][col].push_str(&item.text);
+            item_indices.push(item_idx);
+        }
+    }
+    merge_superscript_marker_rows(&mut row_ys, &mut cells);
+
+    // Validate: need reasonable fill rate
+    let total_cells = row_ys.len() * columns.len();
+    let filled_cells = cells
+        .iter()
+        .flat_map(|r| r.iter())
+        .filter(|c| !c.trim().is_empty())
+        .count();
+    let fill_rate = filled_cells as f32 / total_cells as f32;
+
+    if fill_rate < 0.15 {
+        return None;
+    }
+
+    // Need at least 40% of rows to have content in 2+ columns
+    let multi_col_rows = cells
+        .iter()
+        .filter(|row| row.iter().filter(|c| !c.trim().is_empty()).count() >= 2)
+        .count();
+    // Need majority (>50%) of rows with content in 2+ columns
+    if multi_col_rows * 2 < row_ys.len() {
+        return None;
+    }
+
+    // Reject prose-like content: if cells are too long on average, this is
+    // a multi-column text layout, not a data table. Real table cells are
+    // typically short (≤ 40 chars). Prose paragraphs are much longer.
+    let cell_lengths: Vec<usize> = cells
+        .iter()
+        .flat_map(|r| r.iter())
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| c.trim().len())
+        .collect();
+    if !cell_lengths.is_empty() {
+        let avg_cell_len = cell_lengths.iter().sum::<usize>() as f32 / cell_lengths.len() as f32;
+        if avg_cell_len > 40.0 {
+            return None;
+        }
+        // Reject if any significant number of cells are long prose (> 80 chars)
+        let long_cells = cell_lengths.iter().filter(|&&len| len > 80).count();
+        if long_cells as f32 / cell_lengths.len() as f32 > 0.10 {
+            return None;
+        }
+    }
+
+    // Reject when cells look like prose sentences: if too many cells contain
+    // sentence-ending punctuation (.!?:) it's prose text, not table data.
+    let prose_cells = cells
+        .iter()
+        .flat_map(|r| r.iter())
+        .filter(|c| {
+            let t = c.trim();
+            t.len() > 20
+                && (t.ends_with('.') || t.ends_with('!') || t.ends_with('?') || t.ends_with(':'))
+        })
+        .count();
+    if filled_cells > 0 && prose_cells as f32 / filled_cells as f32 > 0.15 {
+        return None;
+    }
+
+    // Reject when most content is in one column (newspaper-like asymmetry).
+    // Count items per column; if any column has >60% of items, it's likely
+    // a body text column with side annotations, not a data table.
+    let mut items_per_col: Vec<usize> = vec![0; columns.len()];
+    for row in &cells {
+        for (ci, cell) in row.iter().enumerate() {
+            if !cell.trim().is_empty() {
+                items_per_col[ci] += 1;
+            }
+        }
+    }
+    let max_col_items = *items_per_col.iter().max().unwrap_or(&0);
+    if filled_cells > 0 && max_col_items as f32 / filled_cells as f32 > 0.60 {
+        return None;
+    }
+
+    log::debug!(
+        "column-based table: {} cols x {} rows, fill={:.0}%, multi_col_rows={}",
+        columns.len(),
+        row_ys.len(),
+        fill_rate * 100.0,
+        multi_col_rows
+    );
+
+    Some(Table::new(col_xs, row_ys, cells, item_indices))
+}
+
+/// Build a region-scoped two-column key/value table from text baselines.
+///
+/// This intentionally lives outside the full-page heuristic detector. Layout
+/// callers already supplied a table-shaped bbox, and some real table regions
+/// are plain product/spec forms with only two visual columns. The main column
+/// fallback starts at four columns to avoid newspaper/prose false positives;
+/// this path keeps tighter key/value-specific guards instead.
+pub(crate) fn try_build_key_value_table_from_rows(items: &[TextItem], page: u32) -> Option<Table> {
+    let page_items: Vec<RowItem> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.page == page && !item.text.trim().is_empty())
+        .map(|(idx, item)| RowItem {
+            index: idx,
+            item: item.clone(),
+        })
+        .collect();
+
+    if page_items.len() < 4 {
+        return None;
+    }
+
+    let median_font_size = median_f32(page_items.iter().map(|ri| ri.item.font_size).collect())
+        .unwrap_or(10.0)
+        .max(1.0);
+    let y_tol = (median_font_size * 0.75).clamp(4.0, 9.0);
+    let rows = group_key_value_visual_rows(page_items, y_tol);
+    if rows.len() < 2 || rows.len() > 80 {
+        return None;
+    }
+
+    let split_x = infer_key_value_split_x(&rows, median_font_size)?;
+    let mut kv_rows: Vec<KeyValueRow> = Vec::new();
+    let mut paired_rows = 0usize;
+    let mut section_rows = 0usize;
+    let mut left_label_like = 0usize;
+    let mut left_starts = Vec::new();
+    let mut right_starts = Vec::new();
+
+    for row in &rows {
+        let mut left_items = Vec::new();
+        let mut right_items = Vec::new();
+        for item in &row.items {
+            if item.item.x < split_x {
+                left_items.push(item);
+            } else {
+                right_items.push(item);
+            }
+        }
+
+        let left = join_row_item_text(&left_items);
+        let right = join_row_item_text(&right_items);
+        if left.is_empty() && right.is_empty() {
+            continue;
+        }
+
+        let mut item_indices: Vec<usize> = row.items.iter().map(|ri| ri.index).collect();
+        item_indices.sort_unstable();
+        item_indices.dedup();
+
+        if !left.is_empty() && !right.is_empty() {
+            paired_rows += 1;
+            if looks_like_key_value_label(&left) {
+                left_label_like += 1;
+            }
+            if let Some(x) = left_items.first().map(|ri| ri.item.x) {
+                left_starts.push(x);
+            }
+            if let Some(x) = right_items.first().map(|ri| ri.item.x) {
+                right_starts.push(x);
+            }
+        } else if !left.is_empty() {
+            section_rows += 1;
+        }
+
+        kv_rows.push(KeyValueRow {
+            y: row.y,
+            left,
+            right,
+            item_indices,
+        });
+    }
+
+    if kv_rows.len() < 2 || paired_rows < 2 {
+        return None;
+    }
+
+    let header_inferred = key_value_first_pair_is_header(&kv_rows);
+    let data_pairs = if header_inferred {
+        paired_rows.saturating_sub(1)
+    } else {
+        paired_rows
+    };
+    if data_pairs < 1 {
+        return None;
+    }
+
+    if section_rows > paired_rows * 2 + 2 {
+        return None;
+    }
+
+    let label_rows_for_score = if header_inferred {
+        paired_rows.saturating_sub(1)
+    } else {
+        paired_rows
+    };
+    let label_like_for_score = if header_inferred && !kv_rows.is_empty() {
+        left_label_like.saturating_sub(1)
+    } else {
+        left_label_like
+    };
+    if label_rows_for_score >= 2 && label_like_for_score * 2 < label_rows_for_score {
+        return None;
+    }
+
+    let left_x = median_f32(left_starts).unwrap_or_else(|| {
+        rows.iter()
+            .flat_map(|row| row.items.iter().map(|ri| ri.item.x))
+            .fold(f32::INFINITY, f32::min)
+    });
+    let right_x = median_f32(right_starts).unwrap_or(split_x);
+    if !left_x.is_finite() || !right_x.is_finite() || right_x - left_x < 40.0 {
+        return None;
+    }
+    let right_cluster_count = significant_side_x_clusters(&rows, split_x, false);
+    let marker_rows = marker_matrix_value_rows(&kv_rows);
+    if (right_cluster_count >= 5 && paired_rows >= 3)
+        || (right_cluster_count >= 3 && marker_rows >= 3 && marker_rows * 2 >= paired_rows)
+    {
+        return None;
+    }
+
+    if key_value_rows_look_like_prose(&kv_rows, header_inferred) {
+        return None;
+    }
+
+    let mut table_rows = Vec::new();
+    let mut cells = Vec::new();
+    let mut item_indices = Vec::new();
+
+    let mut start_idx = 0usize;
+    if header_inferred {
+        let header = &kv_rows[0];
+        table_rows.push(header.y);
+        cells.push(vec![header.left.clone(), header.right.clone()]);
+        item_indices.extend(header.item_indices.iter().copied());
+        start_idx = 1;
+    } else {
+        table_rows.push(kv_rows.first().map(|row| row.y + y_tol).unwrap_or(0.0));
+        cells.push(vec!["Field".to_string(), "Value".to_string()]);
+    }
+
+    for row in kv_rows.iter().skip(start_idx) {
+        if !row.left.is_empty() && !row.right.is_empty() {
+            table_rows.push(row.y);
+            cells.push(vec![row.left.clone(), row.right.clone()]);
+            item_indices.extend(row.item_indices.iter().copied());
+        } else if !row.left.is_empty() {
+            table_rows.push(row.y);
+            cells.push(vec!["Section".to_string(), row.left.clone()]);
+            item_indices.extend(row.item_indices.iter().copied());
+        } else if !row.right.is_empty() {
+            if let Some(last) = cells.last_mut() {
+                if let Some(value) = last.get_mut(1) {
+                    if !value.trim().is_empty() {
+                        value.push(' ');
+                    }
+                    value.push_str(&row.right);
+                    item_indices.extend(row.item_indices.iter().copied());
+                }
+            }
+        }
+    }
+
+    if cells.len() < 2 {
+        return None;
+    }
+
+    item_indices.sort_unstable();
+    item_indices.dedup();
+
+    log::debug!(
+        "key-value table: {} rows, pairs={}, sections={}, split_x={:.1}",
+        cells.len(),
+        paired_rows,
+        section_rows,
+        split_x
+    );
+
+    Some(Table::new(
+        vec![left_x, right_x],
+        table_rows,
+        cells,
+        item_indices,
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct RowItem {
+    index: usize,
+    item: TextItem,
+}
+
+#[derive(Debug, Clone)]
+struct VisualRow {
+    y: f32,
+    items: Vec<RowItem>,
+}
+
+#[derive(Debug, Clone)]
+struct KeyValueRow {
+    y: f32,
+    left: String,
+    right: String,
+    item_indices: Vec<usize>,
+}
+
+fn group_key_value_visual_rows(mut items: Vec<RowItem>, y_tol: f32) -> Vec<VisualRow> {
+    items.sort_by(|a, b| {
+        b.item
+            .y
+            .total_cmp(&a.item.y)
+            .then_with(|| a.item.x.total_cmp(&b.item.x))
+    });
+
+    let mut rows: Vec<VisualRow> = Vec::new();
+    for row_item in items {
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|row| (row.y - row_item.item.y).abs() <= y_tol)
+        {
+            let len = row.items.len() as f32;
+            row.y = (row.y * len + row_item.item.y) / (len + 1.0);
+            row.items.push(row_item);
+            continue;
+        }
+
+        rows.push(VisualRow {
+            y: row_item.item.y,
+            items: vec![row_item],
+        });
+    }
+
+    for row in &mut rows {
+        row.items.sort_by(|a, b| a.item.x.total_cmp(&b.item.x));
+    }
+    rows.sort_by(|a, b| b.y.total_cmp(&a.y));
+    rows
+}
+
+fn infer_key_value_split_x(rows: &[VisualRow], median_font_size: f32) -> Option<f32> {
+    let min_gap = (median_font_size * 2.0).max(24.0);
+    let mut splits = Vec::new();
+
+    for row in rows {
+        if row.items.len() < 2 {
+            continue;
+        }
+
+        let mut best_gap = 0.0f32;
+        let mut best_split = None;
+        for pair in row.items.windows(2) {
+            let left = &pair[0].item;
+            let right = &pair[1].item;
+            let left_right = left.x + left.width.max(0.0);
+            let gap = right.x - left_right;
+            if gap > best_gap {
+                best_gap = gap;
+                best_split = Some(left_right + gap / 2.0);
+            }
+        }
+
+        if best_gap >= min_gap {
+            if let Some(split) = best_split {
+                splits.push(split);
+            }
+        }
+    }
+
+    if splits.len() < 2 {
+        return None;
+    }
+
+    median_f32(splits)
+}
+
+fn join_row_item_text(items: &[&RowItem]) -> String {
+    let mut parts = Vec::new();
+    for item in items {
+        let trimmed = item.item.text.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed);
+        }
+    }
+    normalize_cell_text(&parts.join(" "))
+}
+
+fn normalize_cell_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn key_value_first_pair_is_header(rows: &[KeyValueRow]) -> bool {
+    let Some(first) = rows.first() else {
+        return false;
+    };
+    if first.left.is_empty() || first.right.is_empty() {
+        return false;
+    }
+    if !looks_like_key_value_header_cell(&first.left)
+        || !looks_like_key_value_header_cell(&first.right)
+    {
+        return false;
+    }
+    rows.iter()
+        .skip(1)
+        .any(|row| !row.left.is_empty() && !row.right.is_empty())
+}
+
+fn looks_like_key_value_header_cell(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.len() < 2 || trimmed.len() > 40 {
+        return false;
+    }
+    let words = word_count_simple(trimmed);
+    if !(1..=4).contains(&words) {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "yes" | "no" | "true" | "false" | "none" | "n/a" | "na"
+    ) {
+        return false;
+    }
+    trimmed.chars().any(|c| c.is_alphabetic())
+        && !trimmed.chars().any(|c| c.is_ascii_digit())
+        && !trimmed.ends_with(['.', ',', ';', ':'])
+}
+
+fn looks_like_key_value_label(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.len() < 2 || trimmed.len() > 90 {
+        return false;
+    }
+    let words = word_count_simple(trimmed);
+    if words == 0 || words > 10 {
+        return false;
+    }
+    if trimmed.ends_with(['.', ',', ';']) {
+        return false;
+    }
+    trimmed.chars().any(|c| c.is_alphabetic())
+}
+
+fn key_value_rows_look_like_prose(rows: &[KeyValueRow], header_inferred: bool) -> bool {
+    let mut long_sentence_cells = 0usize;
+    let mut total_cells = 0usize;
+    let mut total_chars = 0usize;
+    let mut paired_rows = 0usize;
+    let mut solo_prose_rows = 0usize;
+
+    for row in rows.iter().skip(usize::from(header_inferred)) {
+        if !row.left.is_empty() && !row.right.is_empty() {
+            paired_rows += 1;
+        } else {
+            let solo = if row.left.is_empty() {
+                row.right.trim()
+            } else {
+                row.left.trim()
+            };
+            if solo.chars().count() > 70
+                || word_count_simple(solo) > 9
+                || (solo.chars().count() > 35 && solo.ends_with(['.', '!', '?']))
+            {
+                solo_prose_rows += 1;
+            }
+        }
+        for cell in [&row.left, &row.right] {
+            let trimmed = cell.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            total_cells += 1;
+            total_chars += trimmed.chars().count();
+            if trimmed.chars().count() > 100
+                || (trimmed.chars().count() > 55 && trimmed.ends_with(['.', '!', '?']))
+            {
+                long_sentence_cells += 1;
+            }
+        }
+    }
+
+    if paired_rows < 1 || total_cells == 0 {
+        return true;
+    }
+    if solo_prose_rows >= 3 {
+        return true;
+    }
+
+    let avg_chars = total_chars as f32 / total_cells as f32;
+    avg_chars > 75.0 || long_sentence_cells * 2 >= total_cells
+}
+
+fn marker_matrix_value_rows(rows: &[KeyValueRow]) -> usize {
+    rows.iter()
+        .filter(|row| !row.left.is_empty() && compact_marker_value(&row.right))
+        .count()
+}
+
+fn compact_marker_value(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 80 {
+        return false;
+    }
+    if trimmed.chars().any(|ch| ch.is_alphabetic()) {
+        return false;
+    }
+    trimmed
+        .chars()
+        .any(|ch| ch.is_ascii_digit() || matches!(ch, '•' | '●' | '·'))
+}
+
+fn significant_side_x_clusters(rows: &[VisualRow], split_x: f32, left_side: bool) -> usize {
+    let mut xs = Vec::new();
+    for row in rows {
+        for item in &row.items {
+            let is_left = item.item.x < split_x;
+            if is_left == left_side {
+                xs.push(item.item.x);
+            }
+        }
+    }
+    xs.sort_by(|a, b| a.total_cmp(b));
+
+    let mut counts = Vec::new();
+    let mut center = None::<f32>;
+    let mut count = 0usize;
+    for x in xs {
+        match center {
+            Some(current) if (x - current).abs() <= 8.0 => {
+                center = Some((current * count as f32 + x) / (count as f32 + 1.0));
+                count += 1;
+            }
+            Some(_) => {
+                counts.push(count);
+                center = Some(x);
+                count = 1;
+            }
+            None => {
+                center = Some(x);
+                count = 1;
+            }
+        }
+    }
+    if count > 0 {
+        counts.push(count);
+    }
+
+    counts.into_iter().filter(|&count| count >= 2).count()
+}
+
+fn word_count_simple(cell: &str) -> usize {
+    cell.split_whitespace()
+        .filter(|word| word.chars().any(|c| c.is_alphanumeric()))
+        .count()
+}
+
+fn median_f32(mut values: Vec<f32>) -> Option<f32> {
+    values.retain(|value| value.is_finite());
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.total_cmp(b));
+    Some(values[values.len() / 2])
+}
+
+fn merge_superscript_marker_rows(row_ys: &mut Vec<f32>, cells: &mut Vec<Vec<String>>) {
+    let mut row_idx = 0;
+    while row_idx < cells.len() {
+        let non_empty: Vec<(usize, String)> = cells[row_idx]
+            .iter()
+            .enumerate()
+            .filter_map(|(col_idx, cell)| {
+                let trimmed = cell.trim();
+                (!trimmed.is_empty()).then_some((col_idx, trimmed.to_string()))
+            })
+            .collect();
+
+        if non_empty.len() != 1 || !is_superscript_marker_cell(&non_empty[0].1) {
+            row_idx += 1;
+            continue;
+        }
+
+        let (marker_col, marker) = &non_empty[0];
+        let prev =
+            (row_idx > 0).then(|| (row_idx - 1, (row_ys[row_idx - 1] - row_ys[row_idx]).abs()));
+        let next = (row_idx + 1 < cells.len())
+            .then(|| (row_idx + 1, (row_ys[row_idx] - row_ys[row_idx + 1]).abs()));
+        let target = [prev, next]
+            .into_iter()
+            .flatten()
+            .filter(|(_, gap)| *gap <= 10.0)
+            .min_by(|(_, gap_a), (_, gap_b)| gap_a.total_cmp(gap_b))
+            .map(|(idx, _)| idx);
+
+        let Some(target_idx) = target else {
+            row_idx += 1;
+            continue;
+        };
+
+        let target_cell = &mut cells[target_idx][*marker_col];
+        if target_cell.trim().is_empty() {
+            *target_cell = marker.to_string();
+        } else {
+            target_cell.push_str(marker);
+        }
+        cells.remove(row_idx);
+        row_ys.remove(row_idx);
+    }
+}
+
+fn is_superscript_marker_cell(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().count() <= 2
+        && trimmed
+            .chars()
+            .all(|ch| matches!(ch, '*' | '#' | 'o' | 'O' | '°' | 'º' | '†' | '‡'))
+}
+
+/// What kind of structure a detected `Table` represents. Classification is
+/// computed once at construction so consumers don't have to re-analyze the
+/// cells (and stay consistent across detection backends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TableKind {
+    /// A real data table — renders as markdown table syntax.
+    #[default]
+    Data,
+    /// A table of contents — renders as a flat list with tab-aligned page
+    /// numbers via `format_toc_as_list`. Detected through the table pipeline
+    /// because TOCs share row/column structure with tables, but they are not
+    /// data tables and shouldn't appear in `pages_with_tables` etc.
+    Toc,
+}
+
 /// A detected table.
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -276,6 +1104,31 @@ pub struct Table {
     pub cells: Vec<Vec<String>>,
     /// Items that belong to this table
     pub item_indices: Vec<usize>,
+    /// Data table vs TOC. Set by `Table::new` from `cells`.
+    pub kind: TableKind,
+}
+
+impl Table {
+    /// Build a table and classify it (data vs TOC) from its cells.
+    pub fn new(
+        columns: Vec<f32>,
+        rows: Vec<f32>,
+        cells: Vec<Vec<String>>,
+        item_indices: Vec<usize>,
+    ) -> Self {
+        let kind = if is_table_of_contents(&cells) {
+            TableKind::Toc
+        } else {
+            TableKind::Data
+        };
+        Self {
+            columns,
+            rows,
+            cells,
+            item_indices,
+            kind,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +1149,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             item_type: ItemType::Text,
+            mcid: None,
         }
     }
 
@@ -312,6 +1166,7 @@ mod tests {
             is_bold: false,
             is_italic: false,
             item_type: ItemType::Text,
+            mcid: None,
         }
     }
 
@@ -356,12 +1211,197 @@ mod tests {
                 vec!["Cell 1".into(), "Cell 2".into()],
             ],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
 
         let md = table_to_markdown(&table);
-        assert!(md.contains("| Header 1"));
-        assert!(md.contains("| ---"));
-        assert!(md.contains("| Cell 1"));
+        assert!(md.contains("|Header 1|"));
+        assert!(md.contains("|---|"));
+        assert!(md.contains("|Cell 1|"));
+    }
+
+    #[test]
+    fn test_merge_superscript_marker_rows() {
+        let mut rows = vec![506.0, 500.0, 480.0];
+        let mut cells = vec![
+            vec!["".into(), "".into(), "*".into()],
+            vec!["Name".into(), "Method".into(), "Typical values".into()],
+            vec!["Flow".into(), "ASTM D1238".into(), "3.0".into()],
+        ];
+
+        merge_superscript_marker_rows(&mut rows, &mut cells);
+
+        assert_eq!(rows, vec![500.0, 480.0]);
+        assert_eq!(cells[0][2], "Typical values*");
+    }
+
+    #[test]
+    fn test_column_builder_handles_borderless_specs_table() {
+        let items = vec![
+            make_char("*", 458.1, 544.2, 8.0, 4.4),
+            make_char("Properties", 36.0, 538.6, 12.0, 53.1),
+            make_char("Conditions", 195.8, 538.6, 12.0, 55.0),
+            make_char("Method", 297.2, 538.6, 12.0, 39.4),
+            make_char("Typical values", 384.1, 538.6, 12.0, 74.0),
+            make_char("Units", 510.6, 538.6, 8.0, 17.9),
+            make_char("Rheology", 36.0, 508.3, 10.0, 40.6),
+            make_char("o", 209.8, 492.5, 6.5, 3.5),
+            make_char("Melt Flow Rate", 36.0, 488.0, 10.0, 65.2),
+            make_char("230 ", 190.4, 488.0, 10.0, 19.4),
+            make_char("C/2.16 kg", 213.3, 488.0, 10.0, 42.8),
+            make_char("ASTM D1238", 288.4, 488.0, 10.0, 56.8),
+            make_char("3.0 ", 416.4, 488.0, 10.0, 16.9),
+            make_char("g/10 min", 504.1, 488.0, 10.0, 39.5),
+            make_char("Mechanical", 36.0, 451.5, 10.0, 48.3),
+            make_char("Tensile Stress at Yield", 36.0, 431.3, 10.0, 96.7),
+            make_char("50 mm/min", 197.9, 431.3, 10.0, 50.8),
+            make_char("ASTM D638", 291.2, 431.3, 10.0, 51.3),
+            make_char("31 ", 417.9, 431.3, 10.0, 13.9),
+            make_char("MPa", 514.7, 431.3, 10.0, 18.4),
+            make_char("Elongation at Yield", 36.0, 403.0, 10.0, 82.2),
+            make_char("50 mm/min", 197.9, 403.0, 10.0, 50.8),
+            make_char("ASTM D638", 291.2, 403.0, 10.0, 51.3),
+            make_char("8 ", 420.6, 403.0, 10.0, 8.5),
+            make_char("%", 519.1, 403.0, 10.0, 9.7),
+            make_char("Flexural Modulus", 36.0, 374.6, 10.0, 74.0),
+            make_char("ASTM D790", 291.2, 374.6, 10.0, 51.3),
+            make_char("1400", 412.4, 374.6, 10.0, 21.8),
+            make_char("MPa", 514.7, 374.6, 10.0, 18.4),
+        ];
+
+        let table = try_build_table_from_columns(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(
+            md.contains("|Properties|Conditions|Method|Typical values*|Units|"),
+            "{md}"
+        );
+        assert!(md.contains("|Mechanical|||||"), "{md}");
+        assert!(
+            md.contains("|Flexural Modulus||ASTM D790|1400|MPa|"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn test_key_value_builder_recovers_sectioned_specs_table() {
+        let items = vec![
+            make_char("Ordering Information", 69.0, 700.0, 9.0, 96.0),
+            make_char("Package Contents", 69.0, 680.0, 9.0, 82.0),
+            make_char(
+                "CCH Adapter Panel with 3 m pigtail; installation guide",
+                200.0,
+                680.0,
+                9.0,
+                245.0,
+            ),
+            make_char("Units per Delivery", 69.0, 660.0, 9.0, 78.0),
+            make_char("1/1", 200.0, 660.0, 9.0, 18.0),
+        ];
+
+        let table = try_build_key_value_table_from_rows(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(md.contains("|Field|Value|"), "{md}");
+        assert!(md.contains("|Section|Ordering Information|"), "{md}");
+        assert!(
+            md.contains(
+                "|Package Contents|CCH Adapter Panel with 3 m pigtail; installation guide|"
+            ),
+            "{md}"
+        );
+        assert!(md.contains("|Units per Delivery|1/1|"), "{md}");
+    }
+
+    #[test]
+    fn test_key_value_builder_preserves_two_column_header() {
+        let items = vec![
+            make_char("Media", 86.0, 700.0, 10.0, 36.0),
+            make_char("Options", 311.0, 700.0, 10.0, 44.0),
+            make_char("BACnet/IP (Annex J)", 86.0, 680.0, 10.0, 115.0),
+            make_char("Register as Foreign Device", 311.0, 680.0, 10.0, 138.0),
+        ];
+
+        let table = try_build_key_value_table_from_rows(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(md.starts_with("|Media|Options|"), "{md}");
+        assert!(
+            md.contains("|BACnet/IP (Annex J)|Register as Foreign Device|"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn test_key_value_builder_keeps_repeated_spec_sections() {
+        let items = vec![
+            make_char("1.33 DUAL VVT-i", 90.0, 700.0, 9.0, 82.0),
+            make_char("Engine Code", 90.0, 682.0, 9.0, 62.0),
+            make_char("1NR-FE", 406.0, 682.0, 9.0, 42.0),
+            make_char("Type", 90.0, 664.0, 9.0, 24.0),
+            make_char("Four cylinders in-line", 376.0, 664.0, 9.0, 104.0),
+            make_char("1.6 VALVEMATIC", 90.0, 636.0, 9.0, 78.0),
+            make_char("Engine Code", 90.0, 618.0, 9.0, 62.0),
+            make_char("1ZR-FAE", 404.0, 618.0, 9.0, 44.0),
+        ];
+
+        let table = try_build_key_value_table_from_rows(&items, 1).unwrap();
+        let md = table_to_markdown(&table);
+
+        assert!(md.contains("|Section|1.33 DUAL VVT-i|"), "{md}");
+        assert!(md.contains("|Engine Code|1NR-FE|"), "{md}");
+        assert!(md.contains("|Section|1.6 VALVEMATIC|"), "{md}");
+        assert!(md.contains("|Engine Code|1ZR-FAE|"), "{md}");
+    }
+
+    #[test]
+    fn test_key_value_builder_rejects_split_prose() {
+        let items = vec![
+            make_char(
+                "This paragraph describes an operational process and continues without a field label.",
+                70.0,
+                700.0,
+                10.0,
+                350.0,
+            ),
+            make_char(
+                "It was split only because the text wrapped across a wide line.",
+                455.0,
+                700.0,
+                10.0,
+                300.0,
+            ),
+            make_char(
+                "Another sentence explains background context rather than a measurable property.",
+                70.0,
+                680.0,
+                10.0,
+                350.0,
+            ),
+            make_char(
+                "The neighboring phrase is not a value and should not form a table.",
+                455.0,
+                680.0,
+                10.0,
+                300.0,
+            ),
+            make_char(
+                "Finally, this narrative line keeps flowing with normal prose content.",
+                70.0,
+                660.0,
+                10.0,
+                350.0,
+            ),
+            make_char(
+                "It has punctuation and complete sentences on both sides of the gap.",
+                455.0,
+                660.0,
+                10.0,
+                300.0,
+            ),
+        ];
+
+        assert!(try_build_key_value_table_from_rows(&items, 1).is_none());
     }
 
     #[test]
@@ -716,17 +1756,18 @@ mod tests {
                 vec!["3".into(), "5/2".into(), "Item C".into(), "300".into()],
             ],
             item_indices: vec![],
+            kind: TableKind::Data,
         };
 
         let md = table_to_markdown(&table);
         // JAN and FEB should be on their own rows, not merged into adjacent rows
         assert!(
-            md.contains("| JAN"),
+            md.contains("|JAN|"),
             "JAN should be on its own row, got:\n{}",
             md
         );
         assert!(
-            md.contains("| FEB"),
+            md.contains("|FEB|"),
             "FEB should be on its own row, got:\n{}",
             md
         );
